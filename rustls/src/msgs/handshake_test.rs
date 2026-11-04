@@ -368,6 +368,79 @@ fn client_extensions_decode_checks_duplicates() {
 }
 
 #[test]
+fn client_extensions_decorations() {
+    // Decorative extensions are encoded verbatim, around the extensions
+    // rustls chose itself, but never after an extension required to be last.
+    // They are invisible to `collect_used()`, so a server answering one
+    // looks like a server answering something never sent.
+
+    let decorated = ClientExtensions {
+        early_data_request: Some(()),
+        extended_master_secret_request: Some(()),
+        preshared_key_offer: Some(PresharedKeyOffer {
+            identities: vec![],
+            binders: vec![],
+        }),
+        leading_decorations: vec![(ExtensionType::Unknown(0x0a0a), vec![])],
+        trailing_decorations: vec![
+            (ExtensionType::Padding, vec![0, 0]),
+            (ExtensionType::Unknown(0x1a1a), vec![0]),
+        ],
+        ..Default::default()
+    };
+
+    for seed in 0..=0xffff {
+        let mut exts = decorated.clone();
+        exts.order_seed = seed;
+        let encoding = exts.get_encoding();
+
+        // leading decoration first, immediately after the list length
+        assert!(
+            encoding.starts_with(b"\x00\x1f\x0a\x0a\x00\x00"),
+            "{encoding:02x?}"
+        );
+
+        // trailing decorations, then PSK, last
+        assert!(
+            encoding.ends_with(
+                b"\x00\x15\x00\x02\x00\x00\
+                  \x1a\x1a\x00\x01\x00\
+                  \x00\x29\x00\x04\x00\x00\x00\x00"
+            ),
+            "{encoding:02x?}"
+        );
+    }
+
+    // decorations are not reported as used extensions, so they never enter
+    // the set a server's answers are checked against.
+    assert_eq!(
+        decorated.collect_used(),
+        vec![
+            ExtensionType::ExtendedMasterSecret,
+            ExtensionType::PreSharedKey,
+            ExtensionType::EarlyData,
+        ]
+    );
+}
+
+#[test]
+fn client_extensions_decorations_alone() {
+    // decorations are enough to produce an extensions block
+    let exts = ClientExtensions {
+        leading_decorations: vec![(ExtensionType::Unknown(0xfafa), vec![1, 2])],
+        ..Default::default()
+    };
+    let encoding = exts.get_encoding();
+    assert_eq!(encoding, b"\x00\x06\xfa\xfa\x00\x02\x01\x02");
+
+    // and they are dropped on decoding, like any other unknown extension
+    let decoded = ClientExtensions::read_bytes(&encoding).unwrap();
+    assert!(decoded.leading_decorations.is_empty());
+    assert!(decoded.trailing_decorations.is_empty());
+    assert!(decoded.collect_used().is_empty());
+}
+
+#[test]
 fn client_extensions_ordering() {
     // the important thing here is that PSK requests come last,
     // ECH requests come second to last, and order of other extensions

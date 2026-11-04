@@ -978,6 +978,17 @@ extension_struct! {
 
         /// Extensions that must appear contiguously.
         pub(crate) contiguous_extensions: Vec<ExtensionType>,
+
+        /// Decorative extensions, encoded verbatim before all others.
+        ///
+        /// These are never read back from the wire, never reported in
+        /// `collect_used()`, and so can never be negotiated.  See
+        /// `crate::client::ClientHelloDecorations`.
+        pub(crate) leading_decorations: Vec<(ExtensionType, Vec<u8>)>,
+
+        /// Decorative extensions, encoded verbatim after all others, but
+        /// before any extension required to be last.
+        pub(crate) trailing_decorations: Vec<(ExtensionType, Vec<u8>)>,
     }
 }
 
@@ -1010,6 +1021,8 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            leading_decorations,
+            trailing_decorations,
         } = self;
         ClientExtensions {
             server_name: server_name.map(|x| x.into_owned()),
@@ -1038,12 +1051,24 @@ impl ClientExtensions<'_> {
             encrypted_client_hello_outer,
             order_seed,
             contiguous_extensions,
+            leading_decorations,
+            trailing_decorations,
         }
     }
 
     pub(crate) fn used_extensions_in_encoding_order(&self) -> Vec<ExtensionType> {
-        let mut exts = self.order_insensitive_extensions_in_random_order();
+        let mut exts = self
+            .leading_decorations
+            .iter()
+            .map(|(typ, _)| *typ)
+            .collect::<Vec<_>>();
+        exts.extend(self.order_insensitive_extensions_in_random_order());
         exts.extend(&self.contiguous_extensions);
+        exts.extend(
+            self.trailing_decorations
+                .iter()
+                .map(|(typ, _)| *typ),
+        );
 
         if self
             .encrypted_client_hello_outer
@@ -1058,6 +1083,15 @@ impl ClientExtensions<'_> {
             exts.push(ExtensionType::PreSharedKey);
         }
         exts
+    }
+
+    /// Returns the body of the decorative extension named `typ`, if any.
+    fn decoration(&self, typ: ExtensionType) -> Option<&[u8]> {
+        self.leading_decorations
+            .iter()
+            .chain(self.trailing_decorations.iter())
+            .find(|(decoration, _)| *decoration == typ)
+            .map(|(_, body)| body.as_slice())
     }
 
     /// Returns extensions which don't need a specific order, in randomized order.
@@ -1105,7 +1139,15 @@ impl<'a> Codec<'a> for ClientExtensions<'a> {
 
         let body = LengthPrefixedBuffer::new(ListLength::U16, bytes);
         for item in order {
-            self.encode_one(item, body.buf);
+            match self.decoration(item) {
+                Some(payload) => {
+                    item.encode(body.buf);
+                    LengthPrefixedBuffer::new(ListLength::U16, body.buf)
+                        .buf
+                        .extend_from_slice(payload);
+                }
+                None => self.encode_one(item, body.buf),
+            }
         }
     }
 
