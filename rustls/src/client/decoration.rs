@@ -76,15 +76,19 @@ pub(super) fn ech_grease_body(
     secure_random: &dyn SecureRandom,
     payload_len: usize,
 ) -> Result<Vec<u8>, Error> {
-    let mut config_id = [0u8; 1];
-    secure_random.fill(&mut config_id)?;
-
-    let mut enc = vec![0u8; ECH_GREASE_ENC_LEN];
-    secure_random.fill(&mut enc)?;
-
     // `payload` is `opaque payload<1..2^16-1>`: an empty one would not decode.
-    let mut payload = vec![0u8; payload_len.max(1)];
-    secure_random.fill(&mut payload)?;
+    let payload_len = payload_len.max(1);
+
+    // One read for all three fields rather than three.  That is one fewer
+    // trip through `SecureRandom` per connection, and it keeps this off the
+    // sizes `rustls` itself asks for: a `SecureRandom` implementation is
+    // entitled to treat a request of a particular size as significant (one
+    // that stages a crafted 32-byte `ClientHello.random` and session ID, for
+    // instance), and `ECH_GREASE_ENC_LEN` is 32.
+    let mut material = vec![0u8; 1 + ECH_GREASE_ENC_LEN + payload_len];
+    secure_random.fill(&mut material)?;
+    let (config_id, rest) = material.split_at(1);
+    let (enc, payload) = rest.split_at(ECH_GREASE_ENC_LEN);
 
     let mut body = Vec::new();
     EncryptedClientHello::Outer(EncryptedClientHelloOuter {
@@ -93,8 +97,8 @@ pub(super) fn ech_grease_body(
             aead_id: HpkeAead::AES_128_GCM,
         },
         config_id: config_id[0],
-        enc: PayloadU16::new(enc),
-        payload: PayloadU16::new(payload),
+        enc: PayloadU16::new(enc.to_vec()),
+        payload: PayloadU16::new(payload.to_vec()),
     })
     .encode(&mut body);
     Ok(body)
@@ -527,6 +531,8 @@ pub enum DecorativeCipherSuite {
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -665,14 +671,21 @@ mod tests {
         assert_eq!(trailing, vec![(ExtensionType::Padding, vec![0, 0])]);
     }
 
-    /// Counts up, so every byte of the body is visibly filled and the test
-    /// does not need a `CryptoProvider` (there may be none under
-    /// `--no-default-features`).
-    #[derive(Debug)]
-    struct CountingRandom;
+    /// Counts up, so every byte of the body is visibly filled, and records
+    /// the size of every request.  Avoids needing a `CryptoProvider`, of
+    /// which there may be none under `--no-default-features`.
+    #[derive(Debug, Default)]
+    struct CountingRandom {
+        reads: AtomicUsize,
+        last_len: AtomicUsize,
+    }
 
     impl SecureRandom for CountingRandom {
         fn fill(&self, buf: &mut [u8]) -> Result<(), crate::crypto::GetRandomFailed> {
+            self.reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.last_len
+                .store(buf.len(), Ordering::Relaxed);
             for (i, b) in buf.iter_mut().enumerate() {
                 *b = i as u8;
             }
@@ -681,8 +694,21 @@ mod tests {
     }
 
     #[test]
+    fn ech_grease_body_is_drawn_in_one_read() {
+        // Three separate reads would be three chances to collide with a size
+        // a caller's `SecureRandom` treats as significant -- and the
+        // encapsulated key is 32 bytes, the size of `ClientHello.random`.
+        for (payload_len, expected) in [(144, 1 + 32 + 144), (0, 1 + 32 + 1)] {
+            let random = CountingRandom::default();
+            ech_grease_body(&random, payload_len).unwrap();
+            assert_eq!(random.reads.load(Ordering::Relaxed), 1);
+            assert_eq!(random.last_len.load(Ordering::Relaxed), expected);
+        }
+    }
+
+    #[test]
     fn ech_grease_body_is_an_outer_ech_client_hello() {
-        let random = &CountingRandom;
+        let random = &CountingRandom::default();
         let body = ech_grease_body(random, 239).unwrap();
 
         // type(1) + cipher_suite(4) + config_id(1) + enc(2+32) + payload(2+239)
