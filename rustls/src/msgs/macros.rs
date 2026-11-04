@@ -306,7 +306,7 @@ macro_rules! extension_struct {
             }
 
             /// Every `ExtensionType` this structure may encode/decode.
-            const ALL_EXTENSIONS: &'static [ExtensionType] = &[
+            pub(crate) const ALL_EXTENSIONS: &'static [ExtensionType] = &[
                 $($item_id,)*
             ];
         }
