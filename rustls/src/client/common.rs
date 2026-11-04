@@ -39,6 +39,10 @@ pub(super) struct ClientHelloDetails {
     pub(super) sent_extensions: Vec<ExtensionType>,
     pub(super) extension_order_seed: u16,
     pub(super) grease_seed: u16,
+    /// The body of the decorative GREASE `encrypted_client_hello`, if one is
+    /// configured.  Drawn once per connection, because a `HelloRetryRequest`
+    /// retry must repeat the first `ClientHello`'s extensions verbatim.
+    pub(super) ech_grease_body: Option<Vec<u8>>,
     pub(super) offered_cert_compression: bool,
     pub(super) offered_cipher_suites: Vec<CipherSuite>,
 }
@@ -48,12 +52,14 @@ impl ClientHelloDetails {
         alpn_protocols: Vec<ProtocolName>,
         extension_order_seed: u16,
         grease_seed: u16,
+        ech_grease_body: Option<Vec<u8>>,
     ) -> Self {
         Self {
             alpn_protocols,
             sent_extensions: Vec::new(),
             extension_order_seed,
             grease_seed,
+            ech_grease_body,
             offered_cert_compression: false,
             offered_cipher_suites: Vec::new(),
         }

@@ -122,12 +122,22 @@ impl ClientHelloInput {
         // Only drawn when `ClientHello` decorations are in use, so that
         // configurations which do not use them consume exactly as much
         // random material as before.
-        let grease_seed = match &config.client_hello_decorations {
+        let (grease_seed, ech_grease_body) = match &config.client_hello_decorations {
             Some(decorations) => {
                 decorations.validate(&config)?;
-                crate::rand::random_u16(config.provider.secure_random)?
+                let seed = crate::rand::random_u16(config.provider.secure_random)?;
+                // Drawn here rather than per message: a `HelloRetryRequest`
+                // retry must repeat the first `ClientHello`'s extensions.
+                let ech_grease_body = match decorations.ech_grease_extension() {
+                    Some(payload_len) => Some(crate::client::decoration::ech_grease_body(
+                        config.provider.secure_random,
+                        payload_len,
+                    )?),
+                    None => None,
+                };
+                (seed, ech_grease_body)
             }
-            None => 0,
+            None => (0, None),
         };
 
         let hello = ClientHelloDetails::new(
@@ -137,6 +147,7 @@ impl ClientHelloInput {
                 .unwrap_or_default(),
             crate::rand::random_u16(config.provider.secure_random)?,
             grease_seed,
+            ech_grease_body,
         );
 
         Ok(Self {
@@ -399,7 +410,10 @@ fn emit_client_hello_for_retry(
     // `sent_extensions`, so a server that selects or answers one is treated
     // as if it had chosen something never offered.
     if let Some(decorations) = decorations {
-        let (leading, trailing) = decorations.resolve_extensions(input.hello.grease_seed);
+        let (leading, trailing) = decorations.resolve_extensions(
+            input.hello.grease_seed,
+            input.hello.ech_grease_body.as_deref(),
+        );
         exts.leading_decorations = leading;
         exts.trailing_decorations = trailing;
 

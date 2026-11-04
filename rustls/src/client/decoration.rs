@@ -5,10 +5,15 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::client::ClientConfig;
+use crate::crypto::SecureRandom;
 use crate::enums::CipherSuite;
 use crate::error::Error;
-use crate::msgs::enums::ExtensionType;
-use crate::msgs::handshake::ClientExtensions;
+use crate::msgs::base::PayloadU16;
+use crate::msgs::codec::Codec;
+use crate::msgs::enums::{ExtensionType, HpkeAead, HpkeKdf};
+use crate::msgs::handshake::{
+    ClientExtensions, EncryptedClientHello, EncryptedClientHelloOuter, HpkeSymmetricCipherSuite,
+};
 
 /// The sixteen GREASE code points reserved by
 /// [RFC 8701](https://datatracker.ietf.org/doc/html/rfc8701#section-2).
@@ -41,6 +46,58 @@ pub(crate) fn is_grease(value: u16) -> bool {
 pub(crate) fn grease_value(seed: u16, index: usize) -> u16 {
     // 7 is coprime with 16, so `index` 0..16 selects 16 different slots.
     GREASE_VALUES[(usize::from(seed) + index * 7) % GREASE_VALUES.len()]
+}
+
+/// How many bytes of HPKE encapsulated key a GREASE `encrypted_client_hello`
+/// claims.
+///
+/// X25519 (`DHKEM(X25519, HKDF-SHA256)`), which is what BoringSSL GREASEs
+/// with, so this is the length Chromium-based browsers send.
+const ECH_GREASE_ENC_LEN: usize = 32;
+
+/// Build the body of a GREASE `encrypted_client_hello` extension
+/// ([draft-ietf-tls-esni section 6.2][grease-ech]).
+///
+/// `config_id`, the encapsulated key and the payload are random, as they must
+/// be: a GREASE `ECHClientHello` that repeated any of them across connections
+/// would be a stronger identifier than the extension it is imitating.  They
+/// are drawn once per connection and stored, rather than per message, because
+/// the second `ClientHello` of a `HelloRetryRequest` exchange has to repeat
+/// the first one's extensions.
+///
+/// The structure is encoded by `rustls`' own `ECHClientHello` codec, so it is
+/// a well-formed outer `ECHClientHello` and not merely a blob of the right
+/// length.  The named HPKE symmetric suite is `HKDF-SHA256` with
+/// `AES-128-GCM`, which is BoringSSL's GREASE choice on hardware with AES
+/// acceleration.
+///
+/// [grease-ech]: https://www.ietf.org/archive/id/draft-ietf-tls-esni-18.html#name-grease-ech
+pub(super) fn ech_grease_body(
+    secure_random: &dyn SecureRandom,
+    payload_len: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut config_id = [0u8; 1];
+    secure_random.fill(&mut config_id)?;
+
+    let mut enc = vec![0u8; ECH_GREASE_ENC_LEN];
+    secure_random.fill(&mut enc)?;
+
+    // `payload` is `opaque payload<1..2^16-1>`: an empty one would not decode.
+    let mut payload = vec![0u8; payload_len.max(1)];
+    secure_random.fill(&mut payload)?;
+
+    let mut body = Vec::new();
+    EncryptedClientHello::Outer(EncryptedClientHelloOuter {
+        cipher_suite: HpkeSymmetricCipherSuite {
+            kdf_id: HpkeKdf::HKDF_SHA256,
+            aead_id: HpkeAead::AES_128_GCM,
+        },
+        config_id: config_id[0],
+        enc: PayloadU16::new(enc),
+        payload: PayloadU16::new(payload),
+    })
+    .encode(&mut body);
+    Ok(body)
 }
 
 /// Extra content for the `ClientHello` messages this client sends.
@@ -191,6 +248,17 @@ impl ClientHelloDecorations {
         self.renegotiation_info_extension
     }
 
+    /// Does this configuration include a GREASE `encrypted_client_hello`?
+    pub(super) fn ech_grease_extension(&self) -> Option<usize> {
+        self.leading_extensions
+            .iter()
+            .chain(self.trailing_extensions.iter())
+            .find_map(|ext| match ext {
+                DecorativeExtension::EchGrease { payload_len } => Some(*payload_len),
+                _ => None,
+            })
+    }
+
     /// Resolve the decorative extensions for a connection seeded with
     /// `grease_seed`, as `(leading, trailing)` lists of encoded extensions.
     ///
@@ -199,23 +267,30 @@ impl ClientHelloDecorations {
     pub(super) fn resolve_extensions(
         &self,
         grease_seed: u16,
+        ech_grease_body: Option<&[u8]>,
     ) -> (EncodedExtensions, EncodedExtensions) {
         let mut next_grease = 0;
         let mut resolve = |items: &[DecorativeExtension]| {
             items
                 .iter()
-                .map(|item| match item {
+                .filter_map(|item| match item {
                     DecorativeExtension::Grease { body_len } => {
                         let value = grease_value(grease_seed, next_grease);
                         next_grease += 1;
-                        (
+                        Some((
                             ExtensionType::from(value),
                             // RFC 8701 section 3.1 allows any body; Chromium
                             // sends one empty and one single zero byte.
                             vec![0u8; *body_len],
-                        )
+                        ))
                     }
-                    DecorativeExtension::Opaque { typ, body } => (*typ, body.clone()),
+                    DecorativeExtension::Opaque { typ, body } => Some((*typ, body.clone())),
+                    // The body is drawn once per connection in
+                    // `ClientHelloInput::new`, which is also where the
+                    // decorations are validated, so `None` here means this
+                    // variant is not configured and nothing is emitted.
+                    DecorativeExtension::EchGrease { .. } => ech_grease_body
+                        .map(|body| (ExtensionType::EncryptedClientHello, body.to_vec())),
                 })
                 .collect()
         };
@@ -265,13 +340,28 @@ impl ClientHelloDecorations {
     pub(super) fn validate(&self, config: &ClientConfig) -> Result<(), Error> {
         let mut seen = Vec::new();
 
+        let mut ech_greases = 0;
+
         for ext in self
             .leading_extensions
             .iter()
             .chain(self.trailing_extensions.iter())
         {
-            let DecorativeExtension::Opaque { typ, .. } = ext else {
-                continue;
+            let typ = match ext {
+                DecorativeExtension::Grease { .. } => continue,
+                DecorativeExtension::EchGrease { .. } => {
+                    ech_greases += 1;
+                    // A second one would be an illegal duplicate extension,
+                    // and a decorative one alongside real ECH would collide
+                    // with the extension rustls encodes itself.
+                    if ech_greases > 1 || config.ech_mode.is_some() {
+                        return Err(Error::DecorativeExtensionRejected(
+                            ExtensionType::EncryptedClientHello,
+                        ));
+                    }
+                    continue;
+                }
+                DecorativeExtension::Opaque { typ, .. } => typ,
             };
 
             // A code point rustls models is one it may negotiate, and would
@@ -361,6 +451,41 @@ pub enum DecorativeExtension {
         /// length; Chromium sends one empty GREASE extension and one
         /// one-byte one.
         body_len: usize,
+    },
+
+    /// A GREASE `encrypted_client_hello` extension, as current
+    /// Chromium-based browsers send
+    /// ([draft-ietf-tls-esni section 6.2][grease-ech]).
+    ///
+    /// This advertises the `encrypted_client_hello` code point without
+    /// offering ECH: no key is encapsulated, nothing is encrypted, and
+    /// `rustls`' [`EchStatus`][crate::client::EchStatus] stays
+    /// [`NotOffered`][crate::client::EchStatus::NotOffered], so a server that
+    /// answers with retry configurations is rejected with
+    /// [`PeerMisbehaved::UnsolicitedEchExtension`][] -- the same
+    /// fail-rather-than-downgrade behaviour as every other decoration.  Use
+    /// [`EchMode::Grease`][crate::client::EchMode::Grease] instead if you
+    /// want retry configurations ignored rather than treated as misbehaviour;
+    /// that path offers ECH for real and, in this version, is only available
+    /// for a TLS-1.3-only client with an HPKE-capable provider.
+    ///
+    /// `rustls` chooses the `config_id`, the encapsulated key and the
+    /// payload, which are fresh per connection and repeated across a
+    /// `HelloRetryRequest`, exactly as a real GREASE `ECHClientHello` must
+    /// be.  Rejected with [`Error::DecorativeExtensionRejected`] if ECH is
+    /// also configured, or if given twice.
+    ///
+    /// [grease-ech]: https://www.ietf.org/archive/id/draft-ietf-tls-esni-18.html#name-grease-ech
+    /// [`PeerMisbehaved::UnsolicitedEchExtension`]: crate::PeerMisbehaved::UnsolicitedEchExtension
+    EchGrease {
+        /// How many bytes of encrypted-`ClientHelloInner` payload to claim.
+        ///
+        /// A browser sizes this from the inner `ClientHello` it would have
+        /// encrypted, plus the AEAD tag.  It is not part of any JA3 or JA4
+        /// fingerprint, but it does contribute to the `ClientHello`'s length.
+        /// Zero is sent as one byte, because the field's encoding is
+        /// `opaque payload<1..2^16-1>`.
+        payload_len: usize,
     },
 
     /// An extension emitted exactly as given.
@@ -453,7 +578,7 @@ mod tests {
                 DecorativeExtension::Grease { body_len: 1 },
             ]);
 
-        let (leading, trailing) = decorations.resolve_extensions(0);
+        let (leading, trailing) = decorations.resolve_extensions(0, None);
         assert_eq!(
             leading,
             vec![(ExtensionType::from(GREASE_VALUES[0]), vec![])]
@@ -488,11 +613,96 @@ mod tests {
     #[test]
     fn no_decorations_means_no_change() {
         let decorations = ClientHelloDecorations::new();
-        assert_eq!(decorations.resolve_extensions(0), (Vec::new(), Vec::new()));
+        assert_eq!(
+            decorations.resolve_extensions(0, None),
+            (Vec::new(), Vec::new())
+        );
         assert_eq!(
             decorations.decorate_cipher_suites(&[CipherSuite::TLS13_AES_128_GCM_SHA256], 0),
             vec![CipherSuite::TLS13_AES_128_GCM_SHA256]
         );
+    }
+
+    #[test]
+    fn ech_grease_is_reported_from_either_list() {
+        assert_eq!(ClientHelloDecorations::new().ech_grease_extension(), None);
+        assert_eq!(
+            ClientHelloDecorations::new()
+                .with_leading_extensions([DecorativeExtension::EchGrease { payload_len: 7 }])
+                .ech_grease_extension(),
+            Some(7)
+        );
+        assert_eq!(
+            ClientHelloDecorations::new()
+                .with_trailing_extensions([DecorativeExtension::EchGrease { payload_len: 9 }])
+                .ech_grease_extension(),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn ech_grease_resolves_to_the_connection_body_in_place() {
+        let decorations = ClientHelloDecorations::new().with_trailing_extensions([
+            DecorativeExtension::EchGrease { payload_len: 3 },
+            DecorativeExtension::Opaque {
+                typ: ExtensionType::Padding,
+                body: vec![0u8; 2],
+            },
+        ]);
+
+        let (_, trailing) = decorations.resolve_extensions(0, Some(&[1, 2, 3]));
+        assert_eq!(
+            trailing,
+            vec![
+                (ExtensionType::EncryptedClientHello, vec![1, 2, 3]),
+                (ExtensionType::Padding, vec![0, 0]),
+            ]
+        );
+
+        // Without a body there is nothing to emit, and `padding` keeps its
+        // place rather than shifting into the gap.
+        let (_, trailing) = decorations.resolve_extensions(0, None);
+        assert_eq!(trailing, vec![(ExtensionType::Padding, vec![0, 0])]);
+    }
+
+    /// Counts up, so every byte of the body is visibly filled and the test
+    /// does not need a `CryptoProvider` (there may be none under
+    /// `--no-default-features`).
+    #[derive(Debug)]
+    struct CountingRandom;
+
+    impl SecureRandom for CountingRandom {
+        fn fill(&self, buf: &mut [u8]) -> Result<(), crate::crypto::GetRandomFailed> {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ech_grease_body_is_an_outer_ech_client_hello() {
+        let random = &CountingRandom;
+        let body = ech_grease_body(random, 239).unwrap();
+
+        // type(1) + cipher_suite(4) + config_id(1) + enc(2+32) + payload(2+239)
+        assert_eq!(body.len(), 1 + 4 + 1 + 2 + 32 + 2 + 239);
+        assert_eq!(&body[..5], &[0x00, 0x00, 0x01, 0x00, 0x01]);
+        assert_eq!(&body[6..8], &[0x00, 0x20]);
+        assert_eq!(&body[40..42], &[0x00, 0xef]);
+        // It decodes as what it claims to be.
+        let mut reader = crate::msgs::codec::Reader::init(&body);
+        assert!(matches!(
+            EncryptedClientHello::read(&mut reader).unwrap(),
+            EncryptedClientHello::Outer(_)
+        ));
+        assert!(!reader.any_left());
+
+        // `opaque payload<1..2^16-1>`: a zero-length request still sends one
+        // byte, because an empty payload would not decode.
+        let empty = ech_grease_body(random, 0).unwrap();
+        assert_eq!(&empty[empty.len() - 3..empty.len() - 1], &[0x00, 0x01]);
+        assert!(EncryptedClientHello::read(&mut crate::msgs::codec::Reader::init(&empty)).is_ok());
     }
 
     #[test]
@@ -509,7 +719,7 @@ mod tests {
                 0x1301,
             ))]);
 
-        let (leading, _) = decorations.resolve_extensions(0);
+        let (leading, _) = decorations.resolve_extensions(0, None);
         assert_eq!(leading, vec![(ExtensionType::ServerName, vec![])]);
         assert_eq!(
             decorations.decorate_cipher_suites(&[], 0),

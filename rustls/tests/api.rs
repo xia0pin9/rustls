@@ -9900,4 +9900,240 @@ mod client_hello_decorations {
             );
         }
     }
+
+    /// `encrypted_client_hello` (`0xfe0d`).
+    const ECH: u16 = 0xfe0d;
+
+    /// A GREASE `encrypted_client_hello` payload length.  Arbitrary: a
+    /// browser derives it from the inner hello it would have encrypted.
+    const ECH_PAYLOAD_LEN: usize = 239;
+
+    /// The first record of `flight` that carries a `ClientHello`.
+    ///
+    /// The second flight of a `HelloRetryRequest` exchange is preceded by a
+    /// compatibility-mode `ChangeCipherSpec` record.
+    fn client_hello_record(flight: &[u8]) -> &[u8] {
+        let mut at = 0;
+        while at + 5 <= flight.len() {
+            let len = u16::from_be_bytes([flight[at + 3], flight[at + 4]]) as usize;
+            if flight[at] == 0x16 && flight[at + 5] == 0x01 {
+                return &flight[at..];
+            }
+            at += 5 + len;
+        }
+        panic!("no ClientHello in this flight");
+    }
+
+    /// The body of the `typ` extension of the `ClientHello` at the front of
+    /// `flight`, or `None` if it is absent.
+    fn extension_body(flight: &[u8], typ: u16) -> Option<Vec<u8>> {
+        let mut at = 5 + 4 + 2 + 32;
+        at += 1 + flight[at] as usize;
+        let u16_at = |at: &mut usize| {
+            *at += 2;
+            u16::from_be_bytes([flight[*at - 2], flight[*at - 1]])
+        };
+        let cipher_bytes = u16_at(&mut at) as usize;
+        at += cipher_bytes;
+        at += 1 + flight[at] as usize;
+        let end = at + 2 + u16_at(&mut at) as usize;
+        while at < end {
+            let found = u16_at(&mut at);
+            let len = u16_at(&mut at) as usize;
+            if found == typ {
+                return Some(flight[at..at + len].to_vec());
+            }
+            at += len;
+        }
+        None
+    }
+
+    /// Decode the ECH GREASE extension body and check it is a well-formed
+    /// outer `ECHClientHello` of the shape BoringSSL GREASEs with.
+    ///
+    /// Returns `(config_id, enc, payload)`.
+    fn parse_ech_grease(body: &[u8]) -> (u8, Vec<u8>, Vec<u8>) {
+        assert_eq!(body[0], 0x00, "not a ClientHelloOuter");
+        assert_eq!(&body[1..3], &[0x00, 0x01], "kdf_id is not HKDF-SHA256");
+        assert_eq!(&body[3..5], &[0x00, 0x01], "aead_id is not AES-128-GCM");
+        let config_id = body[5];
+        let enc_len = u16::from_be_bytes([body[6], body[7]]) as usize;
+        let enc = body[8..8 + enc_len].to_vec();
+        let at = 8 + enc_len;
+        let payload_len = u16::from_be_bytes([body[at], body[at + 1]]) as usize;
+        let payload = body[at + 2..at + 2 + payload_len].to_vec();
+        assert_eq!(
+            at + 2 + payload_len,
+            body.len(),
+            "trailing bytes after the payload"
+        );
+        assert_eq!(enc.len(), 32, "enc is not an X25519 public key");
+        assert!(!payload.is_empty(), "payload<1..2^16-1> may not be empty");
+        (config_id, enc, payload)
+    }
+
+    fn ech_grease_decorations() -> ClientHelloDecorations {
+        ClientHelloDecorations::new().with_trailing_extensions([
+            DecorativeExtension::EchGrease {
+                payload_len: ECH_PAYLOAD_LEN,
+            },
+            DecorativeExtension::Opaque {
+                typ: ExtensionType::Padding,
+                body: vec![0u8; 16],
+            },
+        ])
+    }
+
+    #[test]
+    fn ech_grease_appears_in_the_client_hello() {
+        let framing = framing_of(&first_flight(decorated_config(ech_grease_decorations())));
+
+        // in the position asked for: second from last, before `padding`
+        assert_eq!(
+            &framing.extensions[framing.extensions.len() - 2..],
+            &[ECH, u16::from(ExtensionType::Padding)]
+        );
+        assert_eq!(
+            framing
+                .extensions
+                .iter()
+                .filter(|e| **e == ECH)
+                .count(),
+            1,
+            "a duplicate extension type is an illegal ClientHello"
+        );
+    }
+
+    #[test]
+    fn ech_grease_is_a_well_formed_outer_ech_client_hello() {
+        let flight = first_flight(decorated_config(ech_grease_decorations()));
+        let body = extension_body(&flight, ECH).expect("ECH GREASE is present");
+        let (_, _, payload) = parse_ech_grease(&body);
+        assert_eq!(payload.len(), ECH_PAYLOAD_LEN);
+    }
+
+    #[test]
+    fn ech_grease_varies_per_connection() {
+        // A GREASE `ECHClientHello` that repeated its encapsulated key would
+        // be a stronger identifier than the extension it imitates.
+        let mut config_ids = Vec::new();
+        let mut encs = Vec::new();
+        let mut payloads = Vec::new();
+        for _ in 0..32 {
+            let flight = first_flight(decorated_config(ech_grease_decorations()));
+            let (config_id, enc, payload) =
+                parse_ech_grease(&extension_body(&flight, ECH).unwrap());
+            config_ids.push(config_id);
+            encs.push(enc);
+            payloads.push(payload);
+        }
+
+        encs.sort_unstable();
+        encs.dedup();
+        assert_eq!(encs.len(), 32, "the encapsulated key repeated");
+        payloads.sort_unstable();
+        payloads.dedup();
+        assert_eq!(payloads.len(), 32, "the payload repeated");
+        config_ids.sort_unstable();
+        config_ids.dedup();
+        assert!(config_ids.len() > 1, "config_id never varied");
+    }
+
+    /// RFC 8446 section 4.1.2 requires the second `ClientHello` of a
+    /// `HelloRetryRequest` exchange to repeat the first one's extensions, so
+    /// the GREASE `ECHClientHello` has to be drawn once per connection and
+    /// not once per message.
+    #[cfg(feature = "tls12")]
+    #[test]
+    fn ech_grease_survives_a_hello_retry_request() {
+        let provider = provider::default_provider();
+        // the client's key share is secp384r1 ...
+        let mut client_config = make_client_config_with_kx_groups(
+            KeyType::Rsa2048,
+            vec![provider::kx_group::SECP384R1, provider::kx_group::X25519],
+            &provider,
+        );
+        client_config.client_hello_decorations = Some(Arc::new(ech_grease_decorations()));
+        // ... but the server only accepts x25519, so it sends a HRR
+        let server_config = make_server_config_with_kx_groups(
+            KeyType::Rsa2048,
+            vec![provider::kx_group::X25519],
+            &provider,
+        );
+
+        let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+
+        let mut first = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut first).unwrap();
+        }
+        server
+            .read_tls(&mut first.as_slice())
+            .unwrap();
+        server.process_new_packets().unwrap();
+
+        let mut hrr = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut hrr).unwrap();
+        }
+        client
+            .read_tls(&mut hrr.as_slice())
+            .unwrap();
+        client.process_new_packets().unwrap();
+
+        let mut second = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut second).unwrap();
+        }
+
+        assert_eq!(
+            extension_body(client_hello_record(&first), ECH).expect("first hello GREASEs ECH"),
+            extension_body(client_hello_record(&second), ECH).expect("retry hello GREASEs ECH"),
+            "the retry repeated a different GREASE ECHClientHello"
+        );
+
+        // The second flight was drained into `second`, so hand it over before
+        // letting the helper finish the exchange.
+        server
+            .read_tls(&mut second.as_slice())
+            .unwrap();
+        server.process_new_packets().unwrap();
+        do_handshake(&mut client, &mut server);
+        assert_eq!(
+            client.handshake_kind(),
+            Some(HandshakeKind::FullWithHelloRetryRequest)
+        );
+    }
+
+    #[test]
+    fn two_ech_greases_are_rejected() {
+        assert_eq!(
+            connect_error(ClientHelloDecorations::new().with_trailing_extensions([
+                DecorativeExtension::EchGrease { payload_len: 1 },
+                DecorativeExtension::EchGrease { payload_len: 1 },
+            ])),
+            Error::DecorativeExtensionRejected(ExtensionType::EncryptedClientHello),
+        );
+    }
+
+    /// A decorative GREASE `encrypted_client_hello` alongside a real ECH
+    /// configuration would encode the extension twice.
+    #[cfg(feature = "aws_lc_rs")]
+    #[test]
+    fn ech_grease_is_rejected_when_ech_is_configured() {
+        let suite = ALL_SUPPORTED_SUITES[0];
+        let (public_key, _) = suite.generate_key_pair().unwrap();
+        let builder = ClientConfig::builder_with_provider(provider::default_provider().into())
+            .with_ech(EchMode::Grease(EchGreaseConfig::new(suite, public_key)))
+            .unwrap();
+        let mut config = finish_client_config(KeyType::Rsa2048, builder);
+        config.client_hello_decorations = Some(Arc::new(
+            ClientHelloDecorations::new()
+                .with_trailing_extensions([DecorativeExtension::EchGrease { payload_len: 1 }]),
+        ));
+        assert_eq!(
+            ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap_err(),
+            Error::DecorativeExtensionRejected(ExtensionType::EncryptedClientHello),
+        );
+    }
 }
