@@ -10,7 +10,7 @@ use super::hs::{self, ClientHelloInput};
 #[cfg(feature = "std")]
 use crate::WantsVerifier;
 use crate::builder::ConfigBuilder;
-use crate::client::{EchMode, EchStatus};
+use crate::client::{ClientHelloDecorations, EchMode, EchStatus};
 use crate::common_state::{CommonState, Protocol, Side};
 use crate::conn::{ConnectionCore, UnbufferedConnectionCommon};
 use crate::crypto::{CryptoProvider, SupportedKxGroup};
@@ -294,6 +294,23 @@ pub struct ClientConfig {
     ///
     /// [RFC 9149]: https://datatracker.ietf.org/doc/html/rfc9149
     pub send_ticket_request: Option<TicketRequest>,
+
+    /// Extra content to add to the `ClientHello` messages this client sends.
+    ///
+    /// Everything configured here is advertised and nothing more: it cannot
+    /// be negotiated, so it cannot alter or weaken what is negotiated.  See
+    /// [`ClientHelloDecorations`] for what that buys and what it costs.
+    ///
+    /// The default is `None`: the `ClientHello` is exactly the message
+    /// `rustls` would send otherwise, byte for byte, and no extra random
+    /// material is consumed.
+    ///
+    /// Invalid decorations are reported as errors when initializing a
+    /// connection, because whether a cipher suite could be negotiated
+    /// depends on this config's [`CryptoProvider`].
+    ///
+    /// [`CryptoProvider`]: crate::crypto::CryptoProvider
+    pub client_hello_decorations: Option<Arc<ClientHelloDecorations>>,
 }
 
 /// Desired session ticket counts for the RFC 9149 `ticket_request` extension.

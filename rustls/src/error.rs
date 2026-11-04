@@ -8,7 +8,8 @@ use std::time::SystemTimeError;
 use pki_types::{AlgorithmIdentifier, ServerName, UnixTime};
 use webpki::KeyUsage;
 
-use crate::enums::{AlertDescription, ContentType, HandshakeType};
+use crate::enums::{AlertDescription, CipherSuite, ContentType, HandshakeType};
+use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{EchConfigPayload, KeyExchangeAlgorithm};
 use crate::rand;
 
@@ -99,6 +100,32 @@ pub enum Error {
     /// The `max_fragment_size` value supplied in configuration was too small,
     /// or too large.
     BadMaxFragmentSize,
+
+    /// A [`DecorativeExtension`][] names an extension that cannot be decorative.
+    ///
+    /// Either `rustls` negotiates this extension itself (so it would be
+    /// encoded twice), or it is a GREASE code point (use
+    /// [`DecorativeExtension::Grease`][] so that `rustls` can keep the
+    /// values distinct and fresh per connection), or two decorations name
+    /// it.
+    ///
+    /// [`DecorativeExtension`]: crate::client::DecorativeExtension
+    /// [`DecorativeExtension::Grease`]: crate::client::DecorativeExtension::Grease
+    DecorativeExtensionRejected(ExtensionType),
+
+    /// A [`DecorativeCipherSuite`][] names a cipher suite that cannot be decorative.
+    ///
+    /// Either the configured [`CryptoProvider`][] supports it (so it could
+    /// be negotiated), or it is a GREASE code point (use
+    /// [`DecorativeCipherSuite::Grease`][]), or it is
+    /// `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` (see
+    /// [`ClientHelloDecorations::with_renegotiation_info_extension()`][]).
+    ///
+    /// [`DecorativeCipherSuite`]: crate::client::DecorativeCipherSuite
+    /// [`DecorativeCipherSuite::Grease`]: crate::client::DecorativeCipherSuite::Grease
+    /// [`CryptoProvider`]: crate::crypto::CryptoProvider
+    /// [`ClientHelloDecorations::with_renegotiation_info_extension()`]: crate::client::ClientHelloDecorations::with_renegotiation_info_extension()
+    DecorativeCipherSuiteRejected(CipherSuite),
 
     /// Specific failure cases from [`keys_match`] or a [`crate::crypto::signer::SigningKey`] that cannot produce a corresponding public key.
     ///
@@ -1004,6 +1031,12 @@ impl fmt::Display for Error {
             Self::BadMaxFragmentSize => {
                 write!(f, "the supplied max_fragment_size was too small or large")
             }
+            Self::DecorativeExtensionRejected(typ) => {
+                write!(f, "{typ:?} cannot be a decorative client hello extension")
+            }
+            Self::DecorativeCipherSuiteRejected(suite) => {
+                write!(f, "{suite:?} cannot be a decorative cipher suite")
+            }
             Self::InconsistentKeys(why) => {
                 write!(f, "keys may not be consistent: {why:?}")
             }
@@ -1289,7 +1322,8 @@ mod tests {
 
     #[test]
     fn smoke() {
-        use crate::enums::{AlertDescription, ContentType, HandshakeType};
+        use crate::enums::{AlertDescription, CipherSuite, ContentType, HandshakeType};
+        use crate::msgs::enums::ExtensionType;
 
         let all = vec![
             Error::InappropriateMessage {
@@ -1354,6 +1388,8 @@ mod tests {
             Error::PeerSentOversizedRecord,
             Error::NoApplicationProtocol,
             Error::BadMaxFragmentSize,
+            Error::DecorativeExtensionRejected(ExtensionType::ServerName),
+            Error::DecorativeCipherSuiteRejected(CipherSuite::TLS13_AES_128_GCM_SHA256),
             Error::InconsistentKeys(InconsistentKeys::KeyMismatch),
             Error::InconsistentKeys(InconsistentKeys::Unknown),
             Error::InvalidCertRevocationList(CertRevocationListError::BadSignature),

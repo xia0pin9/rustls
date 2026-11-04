@@ -38,16 +38,22 @@ pub(super) struct ClientHelloDetails {
     pub(super) alpn_protocols: Vec<ProtocolName>,
     pub(super) sent_extensions: Vec<ExtensionType>,
     pub(super) extension_order_seed: u16,
+    pub(super) grease_seed: u16,
     pub(super) offered_cert_compression: bool,
     pub(super) offered_cipher_suites: Vec<CipherSuite>,
 }
 
 impl ClientHelloDetails {
-    pub(super) fn new(alpn_protocols: Vec<ProtocolName>, extension_order_seed: u16) -> Self {
+    pub(super) fn new(
+        alpn_protocols: Vec<ProtocolName>,
+        extension_order_seed: u16,
+        grease_seed: u16,
+    ) -> Self {
         Self {
             alpn_protocols,
             sent_extensions: Vec::new(),
             extension_order_seed,
+            grease_seed,
             offered_cert_compression: false,
             offered_cipher_suites: Vec::new(),
         }

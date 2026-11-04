@@ -26,7 +26,7 @@ use crate::enums::{
 use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
-use crate::msgs::base::Payload;
+use crate::msgs::base::{Payload, PayloadU8};
 use crate::msgs::enums::{Compression, ExtensionType};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
@@ -119,12 +119,24 @@ impl ClientHelloInput {
             None => SessionId::random(config.provider.secure_random)?,
         };
 
+        // Only drawn when `ClientHello` decorations are in use, so that
+        // configurations which do not use them consume exactly as much
+        // random material as before.
+        let grease_seed = match &config.client_hello_decorations {
+            Some(decorations) => {
+                decorations.validate(&config)?;
+                crate::rand::random_u16(config.provider.secure_random)?
+            }
+            None => 0,
+        };
+
         let hello = ClientHelloDetails::new(
             extra_exts
                 .protocols
                 .clone()
                 .unwrap_or_default(),
             crate::rand::random_u16(config.provider.secure_random)?,
+            grease_seed,
         );
 
         Ok(Self {
@@ -378,7 +390,25 @@ fn emit_client_hello_for_retry(
     // but they also need to keep the same order as the previous ClientHello
     exts.order_seed = input.hello.extension_order_seed;
 
-    let mut cipher_suites: Vec<_> = config
+    let decorations = config
+        .client_hello_decorations
+        .as_deref();
+
+    // `ClientHello` decorations alter the message's framing only.  They are
+    // deliberately not recorded in `offered_cipher_suites` or
+    // `sent_extensions`, so a server that selects or answers one is treated
+    // as if it had chosen something never offered.
+    if let Some(decorations) = decorations {
+        let (leading, trailing) = decorations.resolve_extensions(input.hello.grease_seed);
+        exts.leading_decorations = leading;
+        exts.trailing_decorations = trailing;
+
+        if decorations.renegotiation_info_extension() {
+            exts.renegotiation_info = Some(PayloadU8::empty());
+        }
+    }
+
+    let mut negotiable_cipher_suites: Vec<_> = config
         .provider
         .cipher_suites
         .iter()
@@ -388,10 +418,20 @@ fn emit_client_hello_for_retry(
         })
         .collect();
 
-    if supported_versions.tls12 {
+    let renegotiation_info_extension =
+        decorations.is_some_and(|decorations| decorations.renegotiation_info_extension());
+
+    if supported_versions.tls12 && !renegotiation_info_extension {
         // We don't do renegotiation at all, in fact.
-        cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
+        negotiable_cipher_suites.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
     }
+
+    let cipher_suites = match decorations {
+        Some(decorations) => {
+            decorations.decorate_cipher_suites(&negotiable_cipher_suites, input.hello.grease_seed)
+        }
+        None => negotiable_cipher_suites.clone(),
+    };
 
     let mut chp_payload = ClientHelloPayload {
         client_version: ProtocolVersion::TLSv1_2,
@@ -444,7 +484,7 @@ fn emit_client_hello_for_retry(
 
     // Note what extensions we sent.
     input.hello.sent_extensions = chp_payload.collect_used();
-    input.hello.offered_cipher_suites = chp_payload.cipher_suites.clone();
+    input.hello.offered_cipher_suites = negotiable_cipher_suites;
 
     let mut chp = HandshakeMessagePayload(HandshakePayload::ClientHello(chp_payload));
 

@@ -584,6 +584,7 @@ pub mod client {
     pub(super) mod builder;
     mod client_conn;
     mod common;
+    mod decoration;
     mod ech;
     pub(super) mod handy;
     mod hs;
@@ -600,6 +601,7 @@ pub mod client {
     };
     #[cfg(feature = "std")]
     pub use client_conn::{ClientConnection, WriteEarlyData};
+    pub use decoration::{ClientHelloDecorations, DecorativeCipherSuite, DecorativeExtension};
     pub use ech::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
     pub use handy::AlwaysResolvesClientRawPublicKeys;
     #[cfg(any(feature = "std", feature = "hashbrown"))]

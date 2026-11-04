@@ -16,7 +16,8 @@ use rcgen::{
     CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
 use rustls::client::{
-    ResolvesClientCert, Resumption, TicketRequest, verify_server_cert_signed_by_trust_anchor,
+    ClientHelloDecorations, DecorativeCipherSuite, DecorativeExtension, ResolvesClientCert,
+    Resumption, TicketRequest, verify_server_cert_signed_by_trust_anchor,
 };
 use rustls::crypto::cipher::{AeadKey, InboundOpaqueMessage, Iv};
 use rustls::crypto::tls13::{HkdfExpander, OkmBlock, expand};
@@ -9573,4 +9574,330 @@ fn ml_dsa() {
         ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap()).unwrap();
     let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
     do_handshake(&mut client, &mut server);
+}
+
+mod client_hello_decorations {
+    //! Tests for `ClientHelloDecorations`.
+
+    use super::*;
+
+    /// The GREASE code points of RFC 8701.
+    const GREASE: [u16; 16] = [
+        0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a, 0x8a8a, 0x9a9a, 0xaaaa,
+        0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
+    ];
+
+    /// Chrome's TLS1.2-era cipher suites, none of which rustls implements.
+    const LEGACY_SUITES: [CipherSuite; 6] = [
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+        CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+        CipherSuite::TLS_RSA_WITH_AES_128_GCM_SHA256,
+        CipherSuite::TLS_RSA_WITH_AES_256_GCM_SHA384,
+        CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+        CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
+    ];
+
+    /// The extension and cipher suite code points of a `ClientHello`, in wire order.
+    struct Framing {
+        cipher_suites: Vec<u16>,
+        extensions: Vec<u16>,
+    }
+
+    /// Parse the framing of the `ClientHello` at the front of `flight`.
+    fn framing_of(flight: &[u8]) -> Framing {
+        assert_eq!(flight[0], 0x16, "not a handshake record");
+        assert_eq!(flight[5], 0x01, "not a ClientHello");
+
+        // skip record header (5), handshake header (4), legacy version (2) and random (32)
+        let mut at = 5 + 4 + 2 + 32;
+        let u8_at = |at: &mut usize| {
+            *at += 1;
+            flight[*at - 1]
+        };
+
+        let session_id = u8_at(&mut at) as usize;
+        at += session_id;
+
+        let u16_at = |at: &mut usize| {
+            *at += 2;
+            u16::from_be_bytes([flight[*at - 2], flight[*at - 1]])
+        };
+
+        let cipher_bytes = u16_at(&mut at) as usize;
+        let cipher_suites = flight[at..at + cipher_bytes]
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        at += cipher_bytes;
+
+        let compression = u8_at(&mut at) as usize;
+        at += compression;
+
+        let extension_bytes = u16_at(&mut at) as usize;
+        let end = at + extension_bytes;
+        let mut extensions = Vec::new();
+        while at < end {
+            extensions.push(u16_at(&mut at));
+            let len = u16_at(&mut at) as usize;
+            at += len;
+        }
+        assert_eq!(at, end, "extensions do not fill the extensions block");
+
+        Framing {
+            cipher_suites,
+            extensions,
+        }
+    }
+
+    fn decorated_config(decorations: ClientHelloDecorations) -> ClientConfig {
+        let mut config = make_client_config(KeyType::Rsa2048, &provider::default_provider());
+        config.client_hello_decorations = Some(Arc::new(decorations));
+        config
+    }
+
+    /// Return the first flight a client built from `config` sends.
+    fn first_flight(config: ClientConfig) -> Vec<u8> {
+        let mut flight = Vec::new();
+        ClientConnection::new(Arc::new(config), server_name("localhost"))
+            .unwrap()
+            .write_tls(&mut flight)
+            .unwrap();
+        flight
+    }
+
+    /// The decorations a Chromium-based browser's `ClientHello` carries.
+    fn browser_decorations() -> ClientHelloDecorations {
+        ClientHelloDecorations::new()
+            .with_leading_cipher_suites([DecorativeCipherSuite::Grease])
+            .with_trailing_cipher_suites(LEGACY_SUITES.map(DecorativeCipherSuite::Opaque))
+            .with_leading_extensions([DecorativeExtension::Grease { body_len: 0 }])
+            .with_trailing_extensions([
+                // signed_certificate_timestamp
+                DecorativeExtension::Opaque {
+                    typ: ExtensionType::SCT,
+                    body: vec![],
+                },
+                // application_settings
+                DecorativeExtension::Opaque {
+                    typ: ExtensionType::Unknown(0x4469),
+                    body: vec![0x00, 0x03, 0x02, 0x68, 0x32],
+                },
+                DecorativeExtension::Grease { body_len: 1 },
+                DecorativeExtension::Opaque {
+                    typ: ExtensionType::Padding,
+                    body: vec![0u8; 16],
+                },
+            ])
+            .with_renegotiation_info_extension()
+    }
+
+    #[test]
+    fn decorations_appear_in_the_client_hello() {
+        let framing = framing_of(&first_flight(decorated_config(browser_decorations())));
+
+        // a GREASE cipher suite leads, the legacy suites trail, and the
+        // renegotiation SCSV has been replaced by its extension
+        assert!(
+            GREASE.contains(&framing.cipher_suites[0]),
+            "{:#06x} is not GREASE",
+            framing.cipher_suites[0]
+        );
+        assert_eq!(
+            framing.cipher_suites[framing.cipher_suites.len() - LEGACY_SUITES.len()..],
+            LEGACY_SUITES.map(u16::from)
+        );
+        assert!(!framing.cipher_suites.contains(&0x00ff));
+
+        // a GREASE extension leads
+        assert!(
+            GREASE.contains(&framing.extensions[0]),
+            "{:#06x} is not GREASE",
+            framing.extensions[0]
+        );
+
+        // the trailing decorations trail, in order
+        let tail = &framing.extensions[framing.extensions.len() - 4..];
+        assert_eq!(tail[0], 0x0012);
+        assert_eq!(tail[1], 0x4469);
+        assert!(GREASE.contains(&tail[2]), "{:#06x} is not GREASE", tail[2]);
+        assert_eq!(tail[3], 0x0015);
+
+        // the two GREASE extensions never collide
+        assert_ne!(framing.extensions[0], tail[2]);
+
+        // and the extension rustls was asked to send in place of the SCSV is there
+        assert!(framing.extensions.contains(&0xff01));
+    }
+
+    #[test]
+    fn decorations_vary_per_connection() {
+        let decorations = ClientHelloDecorations::new()
+            .with_leading_cipher_suites([DecorativeCipherSuite::Grease])
+            .with_leading_extensions([DecorativeExtension::Grease { body_len: 0 }]);
+
+        // the chance of 32 connections all drawing the same value is 16^-31
+        let mut seen_extensions = Vec::new();
+        let mut seen_suites = Vec::new();
+        for _ in 0..32 {
+            let framing = framing_of(&first_flight(decorated_config(decorations.clone())));
+            seen_extensions.push(framing.extensions[0]);
+            seen_suites.push(framing.cipher_suites[0]);
+        }
+
+        assert!(
+            seen_extensions
+                .iter()
+                .any(|value| *value != seen_extensions[0])
+        );
+        assert!(
+            seen_suites
+                .iter()
+                .any(|value| *value != seen_suites[0])
+        );
+    }
+
+    #[test]
+    fn no_decorations_changes_nothing() {
+        let undecorated = framing_of(&first_flight(make_client_config(
+            KeyType::Rsa2048,
+            &provider::default_provider(),
+        )));
+        let empty = framing_of(&first_flight(decorated_config(
+            ClientHelloDecorations::new(),
+        )));
+
+        assert_eq!(undecorated.cipher_suites, empty.cipher_suites);
+        // extension order is randomised per connection, so compare the set
+        let mut a = undecorated.extensions.clone();
+        let mut b = empty.extensions.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_decorated_client_still_handshakes() {
+        let client_config = decorated_config(browser_decorations());
+        let server_config = make_server_config(KeyType::Rsa2048, &provider::default_provider());
+
+        let (mut client, mut server) =
+            make_pair_for_arc_configs(&Arc::new(client_config), &Arc::new(server_config));
+        do_handshake(&mut client, &mut server);
+
+        assert_eq!(client.protocol_version(), Some(ProtocolVersion::TLSv1_3));
+    }
+
+    fn connect_error(decorations: ClientHelloDecorations) -> Error {
+        ClientConnection::new(
+            Arc::new(decorated_config(decorations)),
+            server_name("localhost"),
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn decorative_extensions_rustls_negotiates_are_rejected() {
+        for typ in [
+            ExtensionType::ServerName,
+            ExtensionType::SignatureAlgorithms,
+            ExtensionType::KeyShare,
+            ExtensionType::EncryptedClientHello,
+        ] {
+            assert_eq!(
+                connect_error(
+                    ClientHelloDecorations::new().with_leading_extensions([
+                        DecorativeExtension::Opaque { typ, body: vec![] }
+                    ])
+                ),
+                Error::DecorativeExtensionRejected(typ),
+            );
+        }
+    }
+
+    #[test]
+    fn decorative_extensions_using_grease_code_points_are_rejected() {
+        for value in GREASE {
+            let typ = ExtensionType::from(value);
+            assert_eq!(
+                connect_error(
+                    ClientHelloDecorations::new().with_trailing_extensions([
+                        DecorativeExtension::Opaque { typ, body: vec![] }
+                    ])
+                ),
+                Error::DecorativeExtensionRejected(typ),
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_decorative_extensions_are_rejected() {
+        let typ = ExtensionType::Unknown(0x4469);
+        assert_eq!(
+            connect_error(
+                ClientHelloDecorations::new()
+                    .with_leading_extensions([DecorativeExtension::Opaque { typ, body: vec![] }])
+                    .with_trailing_extensions([DecorativeExtension::Opaque { typ, body: vec![1] }])
+            ),
+            Error::DecorativeExtensionRejected(typ),
+        );
+    }
+
+    /// An `Unknown` spelling of a modelled code point is rejected too.
+    ///
+    /// `ExtensionType` and `CipherSuite` are open enums in this release, so
+    /// the same code point has two spellings.  Validation must see through
+    /// that, or it could be bypassed by choosing the other one.
+    #[test]
+    fn unknown_spellings_of_modelled_code_points_are_rejected() {
+        assert_eq!(
+            connect_error(ClientHelloDecorations::new().with_leading_extensions([
+                DecorativeExtension::Opaque {
+                    typ: ExtensionType::Unknown(0x0000),
+                    body: vec![]
+                }
+            ])),
+            Error::DecorativeExtensionRejected(ExtensionType::ServerName),
+        );
+
+        let supported = provider::default_provider().cipher_suites[0].suite();
+        assert_eq!(
+            connect_error(ClientHelloDecorations::new().with_leading_cipher_suites([
+                DecorativeCipherSuite::Opaque(CipherSuite::Unknown(u16::from(supported)))
+            ])),
+            Error::DecorativeCipherSuiteRejected(supported),
+        );
+    }
+
+    #[test]
+    fn decorative_cipher_suites_the_provider_supports_are_rejected() {
+        for suite in provider::default_provider()
+            .cipher_suites
+            .iter()
+            .map(|cs| cs.suite())
+        {
+            assert_eq!(
+                connect_error(
+                    ClientHelloDecorations::new()
+                        .with_leading_cipher_suites([DecorativeCipherSuite::Opaque(suite)])
+                ),
+                Error::DecorativeCipherSuiteRejected(suite),
+            );
+        }
+    }
+
+    #[test]
+    fn decorative_cipher_suites_with_special_meaning_are_rejected() {
+        for suite in [
+            CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV,
+            CipherSuite::from(GREASE[3]),
+        ] {
+            assert_eq!(
+                connect_error(
+                    ClientHelloDecorations::new()
+                        .with_trailing_cipher_suites([DecorativeCipherSuite::Opaque(suite)])
+                ),
+                Error::DecorativeCipherSuiteRejected(suite),
+            );
+        }
+    }
 }
