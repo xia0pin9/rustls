@@ -390,7 +390,7 @@ mod client_hello {
                     .map(|x| &x.master_secret.0[..]),
                 &self.config,
             )?;
-            if !self.previous_hello.is_some() {
+            if self.previous_hello.is_none() {
                 emit_fake_ccs(cx.common);
             }
 

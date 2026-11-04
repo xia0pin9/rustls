@@ -355,7 +355,7 @@ impl ExpectClientHello {
         let tls12_enabled = self
             .config
             .supports_version(ProtocolVersion::TLSv1_2, cx.common.protocol)
-            && !self.previous_hello.is_some();
+            && self.previous_hello.is_none();
 
         // Are we doing TLS1.3?
         let version = if let Some(versions) = &client_hello.supported_versions {
