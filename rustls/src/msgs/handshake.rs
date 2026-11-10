@@ -180,6 +180,17 @@ impl SessionId {
         }
     }
 
+    /// A 32-byte session id supplied by the client itself.
+    ///
+    /// Used by
+    /// [`ClientHelloDecorations::with_session_id_from_client_hello`][], which
+    /// lets a client fill this field in from the serialized `ClientHello`.
+    ///
+    /// [`ClientHelloDecorations::with_session_id_from_client_hello`]: crate::client::ClientHelloDecorations::with_session_id_from_client_hello
+    pub(crate) fn from_32(data: [u8; 32]) -> Self {
+        Self { data, len: 32 }
+    }
+
     #[cfg(feature = "tls12")]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0

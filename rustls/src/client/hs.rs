@@ -27,6 +27,7 @@ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
 use crate::hash_hs::HandshakeHashBuffer;
 use crate::log::{debug, trace};
 use crate::msgs::base::{Payload, PayloadU8};
+use crate::msgs::codec::Codec;
 use crate::msgs::enums::{Compression, ExtensionType};
 use crate::msgs::handshake::{
     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
@@ -520,6 +521,41 @@ fn emit_client_hello_for_retry(
         // No early key schedule in other cases.
         _ => None,
     };
+
+    // Let the client supply `legacy_session_id` now that every other part of
+    // the message is final.  This is deliberately the last thing that touches
+    // the payload: `MessagePayload::handshake` below encodes it once, and
+    // both the handshake transcript and the wire use that one encoding, so
+    // the bytes the client was shown are the bytes that are hashed and sent.
+    //
+    // The first `ClientHello` only.  A retry after a `HelloRetryRequest` must
+    // repeat this value (RFC 8446 section 4.1.2), and it does: it is stored
+    // in `input`, which is what the retry builds its payload from.  Calling
+    // the hook again over the retry's different bytes would produce a
+    // different value and break that rule.
+    if let Some(source) = decorations.and_then(|decorations| decorations.session_id_source()) {
+        // A 32-byte session id only, which is what TLS 1.3 compatibility mode
+        // sends: substituting 32 bytes for a shorter or absent one would
+        // change the length of the message the client was shown.
+        let placeheld = match &mut chp.0 {
+            HandshakePayload::ClientHello(payload)
+                if retryreq.is_none() && payload.session_id.as_ref().len() == 32 =>
+            {
+                payload.session_id = SessionId::from_32([0u8; 32]);
+                true
+            }
+            _ => false,
+        };
+        if placeheld {
+            let session_id = SessionId::from_32(source.session_id(&chp.get_encoding())?);
+            if let HandshakePayload::ClientHello(payload) = &mut chp.0 {
+                payload.session_id = session_id;
+            }
+            // `input` carries it to the `ServerHello` echo check and to any
+            // retry, so every later comparison uses the substituted value.
+            input.session_id = session_id;
+        }
+    }
 
     let ch = Message {
         version: match retryreq {

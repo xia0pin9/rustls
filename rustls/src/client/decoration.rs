@@ -3,6 +3,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::fmt::Debug;
 
 use crate::client::ClientConfig;
 use crate::crypto::SecureRandom;
@@ -14,6 +15,7 @@ use crate::msgs::enums::{ExtensionType, HpkeAead, HpkeKdf};
 use crate::msgs::handshake::{
     ClientExtensions, EncryptedClientHello, EncryptedClientHelloOuter, HpkeSymmetricCipherSuite,
 };
+use crate::sync::Arc;
 
 /// The sixteen GREASE code points reserved by
 /// [RFC 8701](https://datatracker.ietf.org/doc/html/rfc8701#section-2).
@@ -104,6 +106,52 @@ pub(super) fn ech_grease_body(
     Ok(body)
 }
 
+/// Supplies the `legacy_session_id` of an outgoing `ClientHello`, after the
+/// rest of the message has been serialized.
+///
+/// # Why this exists
+///
+/// A protocol layered on top of TLS may want to put a value in
+/// `legacy_session_id` that commits to the rest of the `ClientHello` -- a
+/// MAC or an AEAD tag over the serialized message, so that an observer who
+/// copies the field into a hello of its own cannot have it accepted.  That is
+/// impossible from outside the library: the field has to be chosen before
+/// `rustls` serializes the message, and the message is what it commits to.
+///
+/// This hook closes that circle.  `rustls` serializes the `ClientHello` with
+/// the session id set to 32 zero bytes, hands those bytes to
+/// [`Self::session_id`], and substitutes the 32 bytes it returns.  The
+/// substituted value is what goes into the handshake transcript and onto the
+/// wire, and it is what the server echoes back, so nothing else in the
+/// handshake can disagree about it.
+///
+/// # When it is called
+///
+/// Once per connection, for the first `ClientHello` only, and only when that
+/// hello carries a 32-byte session id (which is what TLS 1.3 compatibility
+/// mode sends).  A `HelloRetryRequest` retry repeats the first hello's
+/// session id, as [RFC 8446 section
+/// 4.1.2](https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.2)
+/// requires, so the hook is not consulted again -- a second call over the
+/// retry's different bytes would produce a different value and break that
+/// rule.
+///
+/// It is called after every other part of the message is final, the
+/// `pre_shared_key` binders and any `encrypted_client_hello` included.
+pub trait SessionIdFromClientHello: Send + Sync + Debug {
+    /// Return the 32 bytes to place in `legacy_session_id`.
+    ///
+    /// `client_hello` is the serialized `ClientHello` handshake message --
+    /// the `client_hello` type byte, its three-byte length and its body --
+    /// with the 32 bytes of `legacy_session_id` set to zero.  Substituting
+    /// the return value into those 32 bytes yields the message that is sent,
+    /// so a value computed over `client_hello` commits to every other byte
+    /// of it.
+    ///
+    /// An error here fails the connection.
+    fn session_id(&self, client_hello: &[u8]) -> Result<[u8; 32], Error>;
+}
+
 /// Extra content for the `ClientHello` messages this client sends.
 ///
 /// # Why this exists
@@ -171,6 +219,7 @@ pub struct ClientHelloDecorations {
     leading_cipher_suites: Vec<DecorativeCipherSuite>,
     trailing_cipher_suites: Vec<DecorativeCipherSuite>,
     renegotiation_info_extension: bool,
+    session_id_source: Option<Arc<dyn SessionIdFromClientHello>>,
 }
 
 impl ClientHelloDecorations {
@@ -247,9 +296,26 @@ impl ClientHelloDecorations {
         self
     }
 
+    /// Fill `legacy_session_id` in from the serialized `ClientHello`.
+    ///
+    /// See [`SessionIdFromClientHello`] for what is passed, when, and the two
+    /// cases in which the hook is not consulted.
+    pub fn with_session_id_from_client_hello(
+        mut self,
+        source: Arc<dyn SessionIdFromClientHello>,
+    ) -> Self {
+        self.session_id_source = Some(source);
+        self
+    }
+
     /// Does this configuration replace the renegotiation SCSV with an extension?
     pub(super) fn renegotiation_info_extension(&self) -> bool {
         self.renegotiation_info_extension
+    }
+
+    /// Who supplies `legacy_session_id`, if anyone.
+    pub(super) fn session_id_source(&self) -> Option<&Arc<dyn SessionIdFromClientHello>> {
+        self.session_id_source.as_ref()
     }
 
     /// Does this configuration include a GREASE `encrypted_client_hello`?

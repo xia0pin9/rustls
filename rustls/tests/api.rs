@@ -17,7 +17,7 @@ use rcgen::{
 };
 use rustls::client::{
     ClientHelloDecorations, DecorativeCipherSuite, DecorativeExtension, ResolvesClientCert,
-    Resumption, TicketRequest, verify_server_cert_signed_by_trust_anchor,
+    Resumption, SessionIdFromClientHello, TicketRequest, verify_server_cert_signed_by_trust_anchor,
 };
 use rustls::crypto::cipher::{AeadKey, InboundOpaqueMessage, Iv};
 use rustls::crypto::tls13::{HkdfExpander, OkmBlock, expand};
@@ -10134,6 +10134,198 @@ mod client_hello_decorations {
         assert_eq!(
             ClientConnection::new(Arc::new(config), server_name("localhost")).unwrap_err(),
             Error::DecorativeExtensionRejected(ExtensionType::EncryptedClientHello),
+        );
+    }
+    /// Where `legacy_session_id` sits inside a `ClientHello` handshake
+    /// message: after the type byte, the three-byte length, the legacy
+    /// version and the random, there is its one-byte length and then the
+    /// field itself.
+    const SESSION_ID_AT: usize = 4 + 2 + 32;
+
+    /// The 32-byte session id of the `ClientHello` handshake message at the
+    /// front of `record`.
+    fn session_id_of(record: &[u8]) -> Vec<u8> {
+        let message = &record[5..];
+        assert_eq!(message[SESSION_ID_AT], 32, "not a 32-byte session id");
+        message[SESSION_ID_AT + 1..SESSION_ID_AT + 33].to_vec()
+    }
+
+    /// A `SessionIdFromClientHello` that records every message it is shown
+    /// and answers with a function of it.
+    #[derive(Debug, Default)]
+    struct RecordingSessionId {
+        shown: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl RecordingSessionId {
+        fn shown(&self) -> Vec<Vec<u8>> {
+            self.shown.lock().unwrap().clone()
+        }
+    }
+
+    impl SessionIdFromClientHello for RecordingSessionId {
+        fn session_id(&self, client_hello: &[u8]) -> Result<[u8; 32], Error> {
+            self.shown
+                .lock()
+                .unwrap()
+                .push(client_hello.to_vec());
+            // Any deterministic function of the message will do: what the
+            // tests check is that it is this value that goes on the wire, and
+            // that the message it was computed over is the one sent.
+            let mut out = [0u8; 32];
+            for (i, byte) in client_hello.iter().enumerate() {
+                out[i % 32] ^= *byte;
+            }
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn session_id_is_supplied_from_the_serialized_client_hello() {
+        let source = Arc::new(RecordingSessionId::default());
+        let flight = first_flight(decorated_config(
+            browser_decorations().with_session_id_from_client_hello(source.clone()),
+        ));
+
+        let shown = source.shown();
+        assert_eq!(shown.len(), 1, "the hook is called once per ClientHello");
+        let shown = &shown[0];
+
+        // The hook is shown the whole handshake message with this one field
+        // zeroed -- and nothing else may differ from what is sent.
+        assert_eq!(shown[0], 0x01, "not a ClientHello");
+        assert_eq!(shown[SESSION_ID_AT], 32);
+        assert_eq!(
+            &shown[SESSION_ID_AT + 1..SESSION_ID_AT + 33],
+            &[0u8; 32],
+            "the session id was not zeroed for the hook"
+        );
+
+        let mut expected = shown.clone();
+        expected[SESSION_ID_AT + 1..SESSION_ID_AT + 33].copy_from_slice(&session_id_of(&flight));
+        assert_eq!(
+            &flight[5..],
+            &expected[..],
+            "the message the hook was shown is not the message that was sent"
+        );
+    }
+
+    /// The point of the hook: the value can commit to the rest of the hello,
+    /// so every other byte has to reach it.  A single byte of padding is the
+    /// smallest change available.
+    #[test]
+    fn the_hook_is_shown_every_other_byte_of_the_hello() {
+        let shown_for = |padding: usize| {
+            let source = Arc::new(RecordingSessionId::default());
+            first_flight(decorated_config(
+                ClientHelloDecorations::new()
+                    .with_trailing_extensions([DecorativeExtension::Opaque {
+                        typ: ExtensionType::Padding,
+                        body: vec![0u8; padding],
+                    }])
+                    .with_session_id_from_client_hello(source.clone()),
+            ));
+            source.shown().remove(0)
+        };
+
+        assert_ne!(
+            shown_for(16),
+            shown_for(17),
+            "a change to the hello did not reach the hook"
+        );
+    }
+
+    /// The transcript has to cover the message as SENT, not the placeholder
+    /// the hook was shown: get that wrong and the handshake fails when
+    /// `Finished` is verified.
+    #[test]
+    fn a_supplied_session_id_completes_a_handshake() {
+        let provider = provider::default_provider();
+        let mut client_config = make_client_config(KeyType::Rsa2048, &provider);
+        client_config.client_hello_decorations = Some(Arc::new(
+            browser_decorations()
+                .with_session_id_from_client_hello(Arc::new(RecordingSessionId::default())),
+        ));
+        let (mut client, mut server) = make_pair_for_configs(
+            client_config,
+            make_server_config(KeyType::Rsa2048, &provider),
+        );
+        do_handshake(&mut client, &mut server);
+    }
+
+    /// RFC 8446 section 4.1.2 requires the second `ClientHello` of a
+    /// `HelloRetryRequest` exchange to repeat the first one's session id, so
+    /// the hook is consulted once per connection and not once per message --
+    /// its answer over the retry's different bytes would be a different
+    /// value.
+    #[cfg(feature = "tls12")]
+    #[test]
+    fn a_supplied_session_id_survives_a_hello_retry_request() {
+        let provider = provider::default_provider();
+        // the client's key share is secp384r1 ...
+        let mut client_config = make_client_config_with_kx_groups(
+            KeyType::Rsa2048,
+            vec![provider::kx_group::SECP384R1, provider::kx_group::X25519],
+            &provider,
+        );
+        let source = Arc::new(RecordingSessionId::default());
+        client_config.client_hello_decorations = Some(Arc::new(
+            browser_decorations().with_session_id_from_client_hello(source.clone()),
+        ));
+        // ... but the server only accepts x25519, so it sends a HRR
+        let server_config = make_server_config_with_kx_groups(
+            KeyType::Rsa2048,
+            vec![provider::kx_group::X25519],
+            &provider,
+        );
+
+        let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+
+        let mut first = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut first).unwrap();
+        }
+        server
+            .read_tls(&mut first.as_slice())
+            .unwrap();
+        server.process_new_packets().unwrap();
+
+        let mut hrr = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut hrr).unwrap();
+        }
+        client
+            .read_tls(&mut hrr.as_slice())
+            .unwrap();
+        client.process_new_packets().unwrap();
+
+        let mut second = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut second).unwrap();
+        }
+
+        assert_eq!(
+            source.shown().len(),
+            1,
+            "the hook was consulted again for the retry"
+        );
+        assert_eq!(
+            session_id_of(client_hello_record(&first)),
+            session_id_of(client_hello_record(&second)),
+            "the retry sent a different session id"
+        );
+
+        // The second flight was drained into `second`, so hand it over before
+        // letting the helper finish the exchange: a transcript that disagreed
+        // about either hello would fail here.
+        server
+            .read_tls(&mut second.as_slice())
+            .unwrap();
+        server.process_new_packets().unwrap();
+        do_handshake(&mut client, &mut server);
+        assert_eq!(
+            client.handshake_kind(),
+            Some(HandshakeKind::FullWithHelloRetryRequest)
         );
     }
 }
